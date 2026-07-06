@@ -1,0 +1,168 @@
+name: CI
+
+# Запускается на каждый push и pull request в main/develop,
+# а также вручную через workflow_dispatch.
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+  DOCKER_IMAGE_API: shorts-pipeline-api
+  DOCKER_IMAGE_WORKER: shorts-pipeline-worker
+
+jobs:
+  # --- Job 1: линтинг и статическая проверка типов ---
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run ruff (lint)
+        run: ruff check app tests
+
+      - name: Run ruff (format check)
+        run: ruff format --check app tests
+
+      - name: Run mypy
+        run: mypy app
+        continue-on-error: true # mypy пока не строгий gate, чтобы не блокировать первые итерации
+
+  # --- Job 2: тесты (pytest + httpx + pytest-celery) ---
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install system dependencies (ffmpeg)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests with coverage
+        env:
+          ENVIRONMENT: ci
+          LLM_PROVIDER: fake
+          TTS_PROVIDER: fake
+          STORAGE_BACKEND: local
+          LOG_JSON: "false"
+        run: |
+          pytest --cov=app --cov-report=term-missing --cov-report=xml -v
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 14
+
+  # --- Job 3: сборка Docker-образов (api + worker) ---
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    # Образы пушим в registry только при пуше в main, а не на каждый PR
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: api
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: |
+            ghcr.io/${{ github.repository }}/api:latest
+            ghcr.io/${{ github.repository }}/api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build Worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: worker
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: |
+            ghcr.io/${{ github.repository }}/worker:latest
+            ghcr.io/${{ github.repository }}/worker:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # --- Job 4: smoke-тест через docker-compose (поднимаем стек и проверяем /health) ---
+  smoke-test:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start stack via docker-compose
+        run: |
+          docker compose -f docker/docker-compose.yml up -d db redis migrate api worker
+        env:
+          LLM_PROVIDER: fake
+          TTS_PROVIDER: fake
+
+      - name: Wait for API health check
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health; then
+              echo "API is healthy"
+              exit 0
+            fi
+            echo "Waiting for API... ($i/30)"
+            sleep 3
+          done
+          echo "API did not become healthy in time"
+          docker compose -f docker/docker-compose.yml logs api
+          exit 1
+
+      - name: Smoke test — create a job
+        run: |
+          curl -sf -X POST http://localhost:8000/api/v1/jobs \
+            -H "Content-Type: application/json" \
+            -d '{"source_video_path": "uploads/smoke_test.mp4", "target_duration_seconds": 45}' \
+            | tee /tmp/job_response.json
+          test -s /tmp/job_response.json
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose -f docker/docker-compose.yml down -v

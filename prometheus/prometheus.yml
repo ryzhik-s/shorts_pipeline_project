@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  # Метрики FastAPI: HTTP-латентность (instrumentator) + кастомные
+  # pipeline-метрики (shorts_job_processing_duration_seconds и т.д.)
+  - job_name: "shorts-api"
+    static_configs:
+      - targets: ["api:8000"]
+    metrics_path: /metrics
+
+  # Flower экспортирует свои метрики Celery в формате Prometheus,
+  # если запущен с флагом --enable-events (включено по умолчанию в docker-compose).
+  - job_name: "flower"
+    static_configs:
+      - targets: ["flower:5555"]
+    metrics_path: /metrics
